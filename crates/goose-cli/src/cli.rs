@@ -9,6 +9,11 @@ use crate::commands::info::handle_info;
 use crate::commands::mcp::run_server;
 use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_deeplink, handle_validate};
+// Import the new handlers from commands::schedule
+use crate::commands::schedule::{
+    handle_schedule_add, handle_schedule_list, handle_schedule_remove, handle_schedule_run_now,
+    handle_schedule_sessions,
+};
 use crate::commands::session::{handle_session_list, handle_session_remove};
 use crate::logging::setup_logging;
 use crate::recipes::recipe::{explain_recipe_with_parameters, load_recipe_as_template};
@@ -29,7 +34,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
 #[group(required = false, multiple = false)]
 struct Identifier {
     #[arg(
@@ -90,17 +95,65 @@ enum SessionCommand {
         )]
         ascending: bool,
     },
-    #[command(about = "Remove sessions")]
+    #[command(about = "Remove sessions. Runs interactively if no ID or regex is provided.")]
     Remove {
-        #[arg(short, long, help = "session id to be removed", default_value = "")]
-        id: String,
+        #[arg(short, long, help = "Session ID to be removed (optional)")]
+        id: Option<String>,
+        #[arg(short, long, help = "Regex for removing matched sessions (optional)")]
+        regex: Option<String>,
+    },
+    #[command(about = "Export a session to Markdown format")]
+    Export {
+        #[command(flatten)]
+        identifier: Option<Identifier>,
+
         #[arg(
             short,
             long,
-            help = "regex for removing matched session",
-            default_value = ""
+            help = "Output file path (default: stdout)",
+            long_help = "Path to save the exported Markdown. If not provided, output will be sent to stdout"
         )]
-        regex: String,
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SchedulerCommand {
+    #[command(about = "Add a new scheduled job")]
+    Add {
+        #[arg(long, help = "Unique ID for the job")]
+        id: String,
+        #[arg(long, help = "Cron string for the schedule (e.g., '0 0 * * * *')")]
+        cron: String,
+        #[arg(
+            long,
+            help = "Recipe source (path to file, or base64 encoded recipe string)"
+        )]
+        recipe_source: String,
+    },
+    #[command(about = "List all scheduled jobs")]
+    List {},
+    #[command(about = "Remove a scheduled job by ID")]
+    Remove {
+        #[arg(long, help = "ID of the job to remove")] // Changed from positional to named --id
+        id: String,
+    },
+    /// List sessions created by a specific schedule
+    #[command(about = "List sessions created by a specific schedule")]
+    Sessions {
+        /// ID of the schedule
+        #[arg(long, help = "ID of the schedule")] // Explicitly make it --id
+        id: String,
+        /// Maximum number of sessions to return
+        #[arg(long, help = "Maximum number of sessions to return")]
+        limit: Option<u32>,
+    },
+    /// Run a scheduled job immediately
+    #[command(about = "Run a scheduled job immediately")]
+    RunNow {
+        /// ID of the schedule to run
+        #[arg(long, help = "ID of the schedule to run")] // Explicitly make it --id
+        id: String,
     },
 }
 
@@ -313,8 +366,8 @@ enum Command {
             short = None,
             long = "recipe",
             value_name = "RECIPE_NAME or FULL_PATH_TO_RECIPE_FILE",
-            help = "Recipe name to get recipe file or the full path of the recipe file",
-            long_help = "Recipe name to get recipe file or the full path of the recipe file that defines a custom agent configuration",
+            help = "Recipe name to get recipe file or the full path of the recipe file (use --explain to see recipe details)",
+            long_help = "Recipe name to get recipe file or the full path of the recipe file that defines a custom agent configuration. Use --explain to see the recipe's title, description, and parameters.",
             conflicts_with = "instructions",
             conflicts_with = "input_text"
         )]
@@ -423,6 +476,13 @@ enum Command {
         command: RecipeCommand,
     },
 
+    /// Manage scheduled jobs
+    #[command(about = "Manage scheduled jobs", visible_alias = "sched")]
+    Schedule {
+        #[command(subcommand)]
+        command: SchedulerCommand,
+    },
+
     /// Update the Goose CLI version
     #[command(about = "Update the goose CLI version")]
     Update {
@@ -443,6 +503,31 @@ enum Command {
     Bench {
         #[command(subcommand)]
         cmd: BenchCommand,
+    },
+
+    /// Start a web server with a chat interface
+    #[command(about = "Start a web server with a chat interface", hide = true)]
+    Web {
+        /// Port to run the web server on
+        #[arg(
+            short,
+            long,
+            default_value = "3000",
+            help = "Port to run the web server on"
+        )]
+        port: u16,
+
+        /// Host to bind the web server to
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            help = "Host to bind the web server to"
+        )]
+        host: String,
+
+        /// Open browser automatically
+        #[arg(long, help = "Open browser automatically when server starts")]
+        open: bool,
     },
 }
 
@@ -502,6 +587,23 @@ pub async fn cli() -> Result<()> {
                 Some(SessionCommand::Remove { id, regex }) => {
                     handle_session_remove(id, regex)?;
                     return Ok(());
+                }
+                Some(SessionCommand::Export { identifier, output }) => {
+                    let session_identifier = if let Some(id) = identifier {
+                        extract_identifier(id)
+                    } else {
+                        // If no identifier is provided, prompt for interactive selection
+                        match crate::commands::session::prompt_interactive_session_selection() {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                return Ok(());
+                            }
+                        }
+                    };
+
+                    crate::commands::session::handle_session_export(session_identifier, output)?;
+                    Ok(())
                 }
                 None => {
                     // Run session command by default
@@ -643,6 +745,32 @@ pub async fn cli() -> Result<()> {
 
             return Ok(());
         }
+        Some(Command::Schedule { command }) => {
+            match command {
+                SchedulerCommand::Add {
+                    id,
+                    cron,
+                    recipe_source,
+                } => {
+                    handle_schedule_add(id, cron, recipe_source).await?;
+                }
+                SchedulerCommand::List {} => {
+                    handle_schedule_list().await?;
+                }
+                SchedulerCommand::Remove { id } => {
+                    handle_schedule_remove(id).await?;
+                }
+                SchedulerCommand::Sessions { id, limit } => {
+                    // New arm
+                    handle_schedule_sessions(id, limit).await?;
+                }
+                SchedulerCommand::RunNow { id } => {
+                    // New arm
+                    handle_schedule_run_now(id).await?;
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Update {
             canary,
             reconfigure,
@@ -680,6 +808,10 @@ pub async fn cli() -> Result<()> {
                     handle_deeplink(&recipe_name)?;
                 }
             }
+            return Ok(());
+        }
+        Some(Command::Web { port, host, open }) => {
+            crate::commands::web::handle_web(port, host, open).await?;
             return Ok(());
         }
         None => {

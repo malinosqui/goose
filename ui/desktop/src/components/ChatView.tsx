@@ -34,6 +34,7 @@ import {
   ToolResponseMessageContent,
   ToolConfirmationRequestMessageContent,
   getTextContent,
+  TextContent,
 } from '../types/message';
 
 export interface ChatType {
@@ -55,11 +56,13 @@ const isUserMessage = (message: Message): boolean => {
 };
 
 export default function ChatView({
+  readyForAutoUserPrompt,
   chat,
   setChat,
   setView,
   setIsGoosehintsModalOpen,
 }: {
+  readyForAutoUserPrompt: boolean;
   chat: ChatType;
   setChat: (chat: ChatType) => void;
   setView: (view: View, viewOptions?: ViewOptions) => void;
@@ -68,6 +71,7 @@ export default function ChatView({
   return (
     <ChatContextManagerProvider>
       <ChatContent
+        readyForAutoUserPrompt={readyForAutoUserPrompt}
         chat={chat}
         setChat={setChat}
         setView={setView}
@@ -83,6 +87,7 @@ function ChatContent({
   setView,
   setIsGoosehintsModalOpen,
 }: {
+  readyForAutoUserPrompt: boolean;
   chat: ChatType;
   setChat: (chat: ChatType) => void;
   setView: (view: View, viewOptions?: ViewOptions) => void;
@@ -97,7 +102,6 @@ function ChatContent({
   const [droppedFiles, setDroppedFiles] = useState<string[]>([]);
 
   const scrollRef = useRef<ScrollAreaHandle>(null);
-  const hasSentPromptRef = useRef(false);
 
   const {
     summaryContent,
@@ -143,6 +147,7 @@ function ChatContent({
     handleInputChange: _handleInputChange,
     handleSubmit: _submitMessage,
     updateMessageStreamBody,
+    notifications,
   } = useMessageStream({
     api: getApiUrl('/reply'),
     initialMessages: chat.messages,
@@ -239,12 +244,20 @@ function ChatContent({
 
         // Create a new window for the recipe editor
         console.log('Opening recipe editor with config:', response.recipe);
+        const recipeConfig = {
+          id: response.recipe.title || 'untitled',
+          name: response.recipe.title || 'Untitled Recipe',
+          description: response.recipe.description || '',
+          instructions: response.recipe.instructions || '',
+          activities: response.recipe.activities || [],
+          prompt: response.recipe.prompt || '',
+        };
         window.electron.createChatWindow(
           undefined, // query
           undefined, // dir
           undefined, // version
           undefined, // resumeSessionId
-          response.recipe, // recipe config
+          recipeConfig, // recipe config
           'recipeEditor' // view type
         );
 
@@ -267,11 +280,8 @@ function ChatContent({
 
   // Update chat messages when they change and save to sessionStorage
   useEffect(() => {
-    setChat((prevChat) => {
-      const updatedChat = { ...prevChat, messages };
-      return updatedChat;
-    });
-  }, [messages, setChat]);
+    setChat({ ...chat, messages });
+  }, [messages, setChat, chat]);
 
   useEffect(() => {
     if (messages.length > 0) {
@@ -279,25 +289,26 @@ function ChatContent({
     }
   }, [messages]);
 
-  useEffect(() => {
-    const prompt = recipeConfig?.prompt;
-    if (prompt && !hasSentPromptRef.current) {
-      append(prompt);
-      hasSentPromptRef.current = true;
-    }
-  }, [recipeConfig?.prompt, append]);
+  // Pre-fill input with recipe prompt instead of auto-sending it
+  const initialPrompt = useMemo(() => {
+    return recipeConfig?.prompt || '';
+  }, [recipeConfig?.prompt]);
 
   // Handle submit
   const handleSubmit = (e: React.FormEvent) => {
     window.electron.startPowerSaveBlocker();
     const customEvent = e as unknown as CustomEvent;
-    const content = customEvent.detail?.value || '';
+    // ChatInput now sends a single 'value' field with text and appended image paths
+    const combinedTextFromInput = customEvent.detail?.value || '';
 
-    if (content.trim()) {
+    if (combinedTextFromInput.trim()) {
       setLastInteractionTime(Date.now());
 
+      // createUserMessage was reverted to only accept text.
+      // It will create a Message with a single TextContent part containing text + paths.
+      const userMessage = createUserMessage(combinedTextFromInput.trim());
+
       if (summarizedThread.length > 0) {
-        // move current `messages` to `ancestorMessages` and `messages` to `summarizedThread`
         resetMessagesWithSummary(
           messages,
           setMessages,
@@ -305,23 +316,21 @@ function ChatContent({
           setAncestorMessages,
           summaryContent
         );
-
-        // update the chat with new sessionId
-
-        // now call the llm
         setTimeout(() => {
-          append(createUserMessage(content));
+          append(userMessage);
           if (scrollRef.current?.scrollToBottom) {
             scrollRef.current.scrollToBottom();
           }
         }, 150);
       } else {
-        // Normal flow (existing code)
-        append(createUserMessage(content));
+        append(userMessage);
         if (scrollRef.current?.scrollToBottom) {
           scrollRef.current.scrollToBottom();
         }
       }
+    } else {
+      // If nothing was actually submitted (e.g. empty input and no images pasted)
+      window.electron.stopPowerSaveBlocker();
     }
   };
 
@@ -346,10 +355,11 @@ function ChatContent({
     // check if the last message is a real user's message
     if (lastMessage && isUserMessage(lastMessage) && !isToolResponse) {
       // Get the text content from the last message before removing it
-      const textContent = lastMessage.content.find((c) => c.type === 'text')?.text || '';
+      const textContent = lastMessage.content.find((c): c is TextContent => c.type === 'text');
+      const textValue = textContent?.text || '';
 
       // Set the text back to the input field
-      _setInput(textContent);
+      _setInput(textValue);
 
       // Remove the last user message if it's the most recent one
       if (messages.length > 1) {
@@ -445,7 +455,8 @@ function ChatContent({
     return filteredMessages
       .reduce<string[]>((history, message) => {
         if (isUserMessage(message)) {
-          const text = message.content.find((c) => c.type === 'text')?.text?.trim();
+          const textContent = message.content.find((c): c is TextContent => c.type === 'text');
+          const text = textContent?.text?.trim();
           if (text) {
             history.push(text);
           }
@@ -460,7 +471,7 @@ function ChatContent({
     const fetchSessionTokens = async () => {
       try {
         const sessionDetails = await fetchSessionDetails(chat.id);
-        setSessionTokenCount(sessionDetails.metadata.total_tokens);
+        setSessionTokenCount(sessionDetails.metadata.total_tokens || 0);
       } catch (err) {
         console.error('Error fetching session token count:', err);
       }
@@ -485,6 +496,16 @@ function ChatContent({
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
   };
+
+  const toolCallNotifications = notifications.reduce((map, item) => {
+    const key = item.request_id;
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    map.get(key).push(item);
+    return map;
+  }, new Map());
+
   return (
     <div className="flex flex-col w-full h-screen items-center justify-center">
       {/* Loader when generating recipe */}
@@ -517,7 +538,7 @@ function ChatContent({
         {messages.length === 0 ? (
           <Splash
             append={append}
-            activities={Array.isArray(recipeConfig?.activities) ? recipeConfig.activities : null}
+            activities={Array.isArray(recipeConfig?.activities) ? recipeConfig!.activities : null}
             title={recipeConfig?.title}
           />
         ) : (
@@ -564,6 +585,7 @@ function ChatContent({
                             const updatedMessages = [...messages, newMessage];
                             setMessages(updatedMessages);
                           }}
+                          toolCallNotifications={toolCallNotifications}
                         />
                       )}
                     </>
@@ -571,6 +593,7 @@ function ChatContent({
                 </div>
               ))}
             </SearchView>
+
             {error && (
               <div className="flex flex-col items-center justify-center p-4">
                 <div className="text-red-700 dark:text-red-300 bg-red-400/50 p-3 rounded-lg mb-2">
@@ -604,7 +627,7 @@ function ChatContent({
             isLoading={isLoading}
             onStop={onStopGoose}
             commandHistory={commandHistory}
-            initialValue={_input}
+            initialValue={_input || initialPrompt}
             setView={setView}
             hasMessages={hasMessages}
             numTokens={sessionTokenCount}
