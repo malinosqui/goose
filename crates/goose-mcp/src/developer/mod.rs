@@ -152,9 +152,9 @@ impl DeveloperRouter {
         // Create the client
         let client = Client::new();
 
-        // Format the prompt for code editing
+        // Format the prompt as specified in the Python example
         let user_prompt = format!(
-            "Update the following code:\n\n<code>\n{}\n</code>\n\nApply this change: {}\n\nReturn only the updated code without any explanation or markdown formatting.",
+            "<code>{}</code>\n<update>{}</update>",
             original_code, update_snippet
         );
 
