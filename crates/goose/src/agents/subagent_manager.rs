@@ -15,23 +15,28 @@ use crate::recipe::Recipe;
 pub struct SubAgentManager {
     subagents: Arc<RwLock<HashMap<String, Arc<SubAgent>>>>,
     handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    pub(crate) provider: Arc<dyn Provider>,
 }
 
 impl SubAgentManager {
     /// Create a new subagent manager
-    pub fn new(provider: Arc<dyn Provider>) -> Self {
+    pub fn new() -> Self {
         Self {
             subagents: Arc::new(RwLock::new(HashMap::new())),
             handles: Arc::new(Mutex::new(HashMap::new())),
-            provider,
         }
     }
 
     /// Spawn a new interactive subagent
-    #[instrument(skip(self, args))]
-    pub async fn spawn_interactive_subagent(&self, args: SpawnSubAgentArgs) -> Result<String> {
-        debug!("Spawning interactive subagent with recipe: {}", args.recipe_name);
+    #[instrument(skip(self, args, provider))]
+    pub async fn spawn_interactive_subagent(
+        &self,
+        args: SpawnSubAgentArgs,
+        provider: Arc<dyn Provider>,
+    ) -> Result<String> {
+        debug!(
+            "Spawning interactive subagent with recipe: {}",
+            args.recipe_name
+        );
 
         // Load the recipe
         let recipe = self.load_recipe(&args.recipe_name).await?;
@@ -45,8 +50,8 @@ impl SubAgentManager {
             config = config.with_timeout(timeout);
         }
 
-        // Create the subagent
-        let (subagent, handle) = SubAgent::new(config, Arc::clone(&self.provider)).await?;
+        // Create the subagent with the parent agent's provider
+        let (subagent, handle) = SubAgent::new(config, provider).await?;
         let subagent_id = subagent.id.clone();
 
         // Store the subagent and its handle
@@ -60,13 +65,19 @@ impl SubAgentManager {
         }
 
         // Process the initial message
-        match subagent.process_message(args.message).await {
+        match subagent.reply_subagent(args.message).await {
             Ok(_stream) => {
                 // For now, we don't handle the stream here - that would be done by the caller
-                debug!("Subagent {} spawned and initial message processed", subagent_id);
+                debug!(
+                    "Subagent {} spawned and initial message processed",
+                    subagent_id
+                );
             }
             Err(e) => {
-                error!("Failed to process initial message for subagent {}: {}", subagent_id, e);
+                error!(
+                    "Failed to process initial message for subagent {}: {}",
+                    subagent_id, e
+                );
                 // Clean up the failed subagent
                 self.terminate_subagent(&subagent_id).await?;
                 return Err(e);
@@ -119,13 +130,15 @@ impl SubAgentManager {
         subagent_id: &str,
         message: String,
     ) -> Result<String> {
-        let subagent = self.get_subagent(subagent_id).await
+        let subagent = self
+            .get_subagent(subagent_id)
+            .await
             .ok_or_else(|| anyhow!("Subagent {} not found", subagent_id))?;
 
         // Add the message to the subagent's conversation
         let user_message = crate::message::Message::user().with_text(message);
         subagent.add_message(user_message).await;
-        
+
         // For now, we'll just return a success message
         // In a full implementation, you would process the message through the agent
         Ok(format!("Message sent to subagent {}", subagent_id))
@@ -185,7 +198,9 @@ impl SubAgentManager {
 
     /// Get formatted conversation from a subagent
     pub async fn get_subagent_conversation(&self, id: &str) -> Result<String> {
-        let subagent = self.get_subagent(id).await
+        let subagent = self
+            .get_subagent(id)
+            .await
             .ok_or_else(|| anyhow!("Subagent {} not found", id))?;
 
         Ok(subagent.get_formatted_conversation().await)
@@ -247,7 +262,10 @@ impl SubAgentManager {
             }
         }
 
-        Err(anyhow!("Recipe file '{}' not found in current directory or common recipe locations", recipe_name))
+        Err(anyhow!(
+            "Recipe file '{}' not found in current directory or common recipe locations",
+            recipe_name
+        ))
     }
 
     /// Get count of active subagents

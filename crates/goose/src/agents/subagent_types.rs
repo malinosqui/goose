@@ -27,4 +27,4 @@ impl SpawnSubAgentArgs {
         self.timeout_seconds = Some(timeout_seconds);
         self
     }
-} 
+}

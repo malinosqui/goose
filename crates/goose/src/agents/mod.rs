@@ -15,6 +15,8 @@ mod tool_execution;
 mod tool_router_index_manager;
 pub(crate) mod tool_vectordb;
 mod types;
+pub mod subagent_tools;
+pub mod subagent_handler;
 
 pub use agent::{Agent, AgentEvent};
 pub use extension::ExtensionConfig;
