@@ -28,6 +28,8 @@ use crate::agents::extension_manager::{get_parameter_names, ExtensionManager};
 use crate::agents::platform_tools::{
     PLATFORM_LIST_RESOURCES_TOOL_NAME, PLATFORM_MANAGE_EXTENSIONS_TOOL_NAME,
     PLATFORM_READ_RESOURCE_TOOL_NAME, PLATFORM_SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME,
+    PLATFORM_SPAWN_INTERACTIVE_SUBAGENT_TOOL_NAME, PLATFORM_LIST_SUBAGENTS_TOOL_NAME,
+    PLATFORM_GET_SUBAGENT_STATUS_TOOL_NAME, PLATFORM_TERMINATE_SUBAGENT_TOOL_NAME,
 };
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::router_tool_selector::{
@@ -44,6 +46,7 @@ use mcp_core::{
 
 use super::platform_tools;
 use super::router_tools;
+use super::subagent_manager::SubAgentManager;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 
 /// The main goose Agent
@@ -59,6 +62,7 @@ pub struct Agent {
     pub(super) tool_result_rx: ToolResultReceiver,
     pub(super) tool_monitor: Mutex<Option<ToolMonitor>>,
     pub(super) router_tool_selector: Mutex<Option<Arc<Box<dyn RouterToolSelector>>>>,
+    pub(super) subagent_manager: Mutex<Option<SubAgentManager>>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +89,7 @@ impl Agent {
             tool_result_rx: Arc::new(Mutex::new(tool_rx)),
             tool_monitor: Mutex::new(None),
             router_tool_selector: Mutex::new(None),
+            subagent_manager: Mutex::new(None),
         }
     }
 
@@ -239,6 +244,14 @@ impl Agent {
             )
         } else if tool_call.name == PLATFORM_SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME {
             ToolCallResult::from(extension_manager.search_available_extensions().await)
+        } else if tool_call.name == PLATFORM_SPAWN_INTERACTIVE_SUBAGENT_TOOL_NAME {
+            ToolCallResult::from(self.handle_spawn_subagent(tool_call.arguments.clone()).await)
+        } else if tool_call.name == PLATFORM_LIST_SUBAGENTS_TOOL_NAME {
+            ToolCallResult::from(self.handle_list_subagents().await)
+        } else if tool_call.name == PLATFORM_GET_SUBAGENT_STATUS_TOOL_NAME {
+            ToolCallResult::from(self.handle_get_subagent_status(tool_call.arguments.clone()).await)
+        } else if tool_call.name == PLATFORM_TERMINATE_SUBAGENT_TOOL_NAME {
+            ToolCallResult::from(self.handle_terminate_subagent(tool_call.arguments.clone()).await)
         } else if self.is_frontend_tool(&tool_call.name).await {
             // For frontend tools, return an error indicating we need frontend execution
             ToolCallResult::from(Err(ToolError::ExecutionError(
@@ -432,6 +445,12 @@ impl Agent {
             // Add platform tools
             prefixed_tools.push(platform_tools::search_available_extensions_tool());
             prefixed_tools.push(platform_tools::manage_extensions_tool());
+
+            // Add subagent tools
+            prefixed_tools.push(platform_tools::spawn_interactive_subagent_tool());
+            prefixed_tools.push(platform_tools::list_subagents_tool());
+            prefixed_tools.push(platform_tools::get_subagent_status_tool());
+            prefixed_tools.push(platform_tools::terminate_subagent_tool());
 
             // Add resource tools if supported
             if extension_manager.supports_resources() {
@@ -765,6 +784,10 @@ impl Agent {
     /// Update the provider used by this agent
     pub async fn update_provider(&self, provider: Arc<dyn Provider>) -> Result<()> {
         *self.provider.lock().await = Some(provider.clone());
+        
+        // Initialize subagent manager with the provider
+        *self.subagent_manager.lock().await = Some(SubAgentManager::new(provider.clone()));
+        
         self.update_router_tool_selector(provider).await?;
         Ok(())
     }
@@ -984,5 +1007,159 @@ impl Agent {
             .expect("valid recipe");
 
         Ok(recipe)
+    }
+
+    // Subagent management methods
+    
+    /// Handle spawning a new interactive subagent
+    async fn handle_spawn_subagent(&self, arguments: serde_json::Value) -> Result<Vec<Content>, ToolError> {
+        use crate::agents::subagent_types::SpawnSubAgentArgs;
+        
+        let subagent_manager = self.subagent_manager.lock().await;
+        let manager = subagent_manager.as_ref()
+            .ok_or_else(|| ToolError::ExecutionError("Subagent manager not initialized".to_string()))?;
+
+        // Parse arguments
+        let recipe_name = arguments.get("recipe_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionError("Missing recipe_name parameter".to_string()))?
+            .to_string();
+
+        let message = arguments.get("message")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionError("Missing message parameter".to_string()))?
+            .to_string();
+
+        let mut args = SpawnSubAgentArgs::new(recipe_name, message);
+
+        if let Some(max_turns) = arguments.get("max_turns").and_then(|v| v.as_u64()) {
+            args = args.with_max_turns(max_turns as usize);
+        }
+
+        if let Some(timeout) = arguments.get("timeout_seconds").and_then(|v| v.as_u64()) {
+            args = args.with_timeout(timeout);
+        }
+
+        // Spawn the subagent
+        match manager.spawn_interactive_subagent(args).await {
+            Ok(subagent_id) => {
+                Ok(vec![Content::text(format!(
+                    "Subagent spawned successfully with ID: {}\nUse platform__get_subagent_status to check progress.",
+                    subagent_id
+                ))])
+            }
+            Err(e) => Err(ToolError::ExecutionError(format!("Failed to spawn subagent: {}", e))),
+        }
+    }
+
+    /// Handle listing all subagents
+    async fn handle_list_subagents(&self) -> Result<Vec<Content>, ToolError> {
+        let subagent_manager = self.subagent_manager.lock().await;
+        let manager = subagent_manager.as_ref()
+            .ok_or_else(|| ToolError::ExecutionError("Subagent manager not initialized".to_string()))?;
+
+        let subagent_ids = manager.list_subagents().await;
+        let status_map = manager.get_subagent_status().await;
+
+        if subagent_ids.is_empty() {
+            Ok(vec![Content::text("No active subagents.".to_string())])
+        } else {
+            let mut response = String::from("Active subagents:\n");
+            for id in subagent_ids {
+                let status = status_map.get(&id).map(|s| format!("{:?}", s)).unwrap_or_else(|| "Unknown".to_string());
+                response.push_str(&format!("- {}: {}\n", id, status));
+            }
+            Ok(vec![Content::text(response)])
+        }
+    }
+
+    /// Handle getting subagent status
+    async fn handle_get_subagent_status(&self, arguments: serde_json::Value) -> Result<Vec<Content>, ToolError> {
+        let subagent_manager = self.subagent_manager.lock().await;
+        let manager = subagent_manager.as_ref()
+            .ok_or_else(|| ToolError::ExecutionError("Subagent manager not initialized".to_string()))?;
+
+        let include_conversation = arguments.get("include_conversation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if let Some(subagent_id) = arguments.get("subagent_id").and_then(|v| v.as_str()) {
+            // Get status for specific subagent
+            if let Some(subagent) = manager.get_subagent(subagent_id).await {
+                let progress = subagent.get_progress().await;
+                let mut response = format!(
+                    "Subagent ID: {}\nStatus: {:?}\nMessage: {}\nTurn: {}",
+                    progress.subagent_id, progress.status, progress.message, progress.turn
+                );
+                
+                if let Some(max_turns) = progress.max_turns {
+                    response.push_str(&format!("/{}", max_turns));
+                }
+                
+                response.push_str(&format!("\nTimestamp: {}", progress.timestamp));
+
+                if include_conversation {
+                    response.push_str("\n\n");
+                    response.push_str(&subagent.get_formatted_conversation().await);
+                }
+
+                Ok(vec![Content::text(response)])
+            } else {
+                Err(ToolError::ExecutionError(format!("Subagent {} not found", subagent_id)))
+            }
+        } else {
+            // Get status for all subagents
+            let progress_map = manager.get_subagent_progress().await;
+            
+            if progress_map.is_empty() {
+                Ok(vec![Content::text("No active subagents.".to_string())])
+            } else {
+                let mut response = String::from("All subagent status:\n\n");
+                for (id, progress) in progress_map {
+                    response.push_str(&format!(
+                        "Subagent ID: {}\nStatus: {:?}\nMessage: {}\nTurn: {}",
+                        id, progress.status, progress.message, progress.turn
+                    ));
+                    
+                    if let Some(max_turns) = progress.max_turns {
+                        response.push_str(&format!("/{}", max_turns));
+                    }
+                    
+                    response.push_str(&format!("\nTimestamp: {}\n\n", progress.timestamp));
+                }
+                Ok(vec![Content::text(response)])
+            }
+        }
+    }
+
+    /// Handle terminating subagents
+    async fn handle_terminate_subagent(&self, arguments: serde_json::Value) -> Result<Vec<Content>, ToolError> {
+        let subagent_manager = self.subagent_manager.lock().await;
+        let manager = subagent_manager.as_ref()
+            .ok_or_else(|| ToolError::ExecutionError("Subagent manager not initialized".to_string()))?;
+
+        let subagent_id = arguments.get("subagent_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionError("Missing subagent_id parameter".to_string()))?;
+
+        if subagent_id == "all" {
+            // Terminate all subagents
+            match manager.terminate_all_subagents().await {
+                Ok(_) => Ok(vec![Content::text("All subagents terminated successfully.".to_string())]),
+                Err(e) => Err(ToolError::ExecutionError(format!("Failed to terminate all subagents: {}", e))),
+            }
+        } else {
+            // Terminate specific subagent
+            match manager.terminate_subagent(subagent_id).await {
+                Ok(_) => Ok(vec![Content::text(format!("Subagent {} terminated successfully.", subagent_id))]),
+                Err(e) => Err(ToolError::ExecutionError(format!("Failed to terminate subagent {}: {}", subagent_id, e))),
+            }
+        }
+    }
+
+    /// Get subagent manager (for external access if needed)
+    pub async fn get_subagent_manager(&self) -> Option<Arc<SubAgentManager>> {
+        let manager = self.subagent_manager.lock().await;
+        manager.as_ref().map(|m| Arc::new(SubAgentManager::new(m.provider.clone())))
     }
 }
