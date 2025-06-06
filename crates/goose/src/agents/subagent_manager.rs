@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, instrument, warn};
 
+use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::subagent::{SubAgent, SubAgentConfig, SubAgentProgress, SubAgentStatus};
 use crate::agents::subagent_types::SpawnSubAgentArgs;
 use crate::providers::base::Provider;
@@ -27,11 +28,12 @@ impl SubAgentManager {
     }
 
     /// Spawn a new interactive subagent
-    #[instrument(skip(self, args, provider))]
+    #[instrument(skip(self, args, provider, extension_manager))]
     pub async fn spawn_interactive_subagent(
         &self,
         args: SpawnSubAgentArgs,
         provider: Arc<dyn Provider>,
+        extension_manager: Arc<tokio::sync::RwLockReadGuard<'_, ExtensionManager>>,
     ) -> Result<String> {
         debug!(
             "Spawning interactive subagent with recipe: {}",
@@ -51,7 +53,7 @@ impl SubAgentManager {
         }
 
         // Create the subagent with the parent agent's provider
-        let (subagent, handle) = SubAgent::new(config, provider).await?;
+        let (subagent, handle) = SubAgent::new(config, Arc::clone(&provider), Arc::clone(&extension_manager)).await?;
         let subagent_id = subagent.id.clone();
 
         // Store the subagent and its handle
@@ -65,7 +67,7 @@ impl SubAgentManager {
         }
 
         // Process the initial message
-        match subagent.reply_subagent(args.message).await {
+        match subagent.reply_subagent(args.message, provider, extension_manager).await {
             Ok(_stream) => {
                 // For now, we don't handle the stream here - that would be done by the caller
                 debug!(

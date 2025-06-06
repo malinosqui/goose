@@ -6,6 +6,7 @@ pub const SUBAGENT_SPAWN_INTERACTIVE_TOOL_NAME: &str =
     "subagent__spawn_interactive";
 pub const SUBAGENT_LIST_TOOL_NAME: &str = "subagent__list";
 pub const SUBAGENT_CHECK_PROGRESS_TOOL_NAME: &str = "subagent__check_progress";
+pub const SUBAGENT_SEND_MESSAGE_TOOL_NAME: &str = "subagent__send_message";
 
 pub fn spawn_interactive_subagent_tool() -> Tool {
     Tool::new(
@@ -105,6 +106,41 @@ pub fn check_subagent_progress_tool() -> Tool {
             read_only_hint: true,
             destructive_hint: false,
             idempotent_hint: true,
+            open_world_hint: false,
+        }),
+    )
+}
+
+pub fn send_message_to_subagent_tool() -> Tool {
+    Tool::new(
+        SUBAGENT_SEND_MESSAGE_TOOL_NAME.to_string(),
+        indoc! {r#"
+            Send a message to an existing subagent.
+            
+            This tool allows you to continue interacting with a previously spawned subagent.
+            The subagent will process the message and maintain its conversation history.
+            
+            Use subagent__list to see available subagents and subagent__check_progress to monitor their status.
+        "#}.to_string(),
+        json!({
+            "type": "object",
+            "required": ["subagent_id", "message"],
+            "properties": {
+                "subagent_id": {
+                    "type": "string", 
+                    "description": "ID of the subagent to send the message to"
+                },
+                "message": {
+                    "type": "string", 
+                    "description": "Message to send to the subagent"
+                }
+            }
+        }),
+        Some(ToolAnnotations {
+            title: Some("Send message to subagent".to_string()),
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
             open_world_hint: false,
         }),
     )

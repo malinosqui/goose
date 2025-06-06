@@ -1,19 +1,26 @@
-use std::sync::Arc;
-
-use anyhow::{anyhow, Result};
+use crate::{
+    agents::{
+        extension_manager::ExtensionManager,
+        Agent,
+    },
+    message::{Message, MessageContent, ToolRequest},
+    providers::base::Provider,
+    providers::errors::ProviderError,
+    recipe::Recipe,
+};
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use mcp_core::role::Role;
-use mcp_core::handler::ToolError;
+use mcp_core::{
+    handler::ToolError,
+    role::Role,
+    tool::{Tool, ToolCall},
+};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, instrument};
 use uuid::Uuid;
-
-use crate::agents::Agent;
-use crate::message::Message;
-use crate::providers::base::Provider;
-use crate::providers::errors::ProviderError;
-use crate::recipe::Recipe;
+use futures::stream::{self, Stream};
 
 /// Status of a subagent
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,37 +78,37 @@ pub struct SubAgent {
     pub conversation: Arc<Mutex<Vec<Message>>>,
     pub status: Arc<RwLock<SubAgentStatus>>,
     pub config: SubAgentConfig,
-    pub parent_agent: Arc<Agent>,  // Reference to parent agent
     pub turn_count: Arc<Mutex<usize>>,
     pub created_at: DateTime<Utc>,
+    pub recipe_extensions: Arc<Mutex<Vec<String>>>,
+    pub missing_extensions: Arc<Mutex<Vec<String>>>, // Track extensions that weren't enabled
 }
 
 impl SubAgent {
     /// Create a new subagent with the given configuration and provider
-    #[instrument(skip(config, provider))]
+    #[instrument(skip(config, provider, extension_manager))]
     pub async fn new(
         config: SubAgentConfig,
         provider: Arc<dyn Provider>,
-    ) -> Result<(Arc<Self>, tokio::task::JoinHandle<()>)> {
+        extension_manager: Arc<tokio::sync::RwLockReadGuard<'_, ExtensionManager>>,
+    ) -> Result<(Arc<Self>, tokio::task::JoinHandle<()>), anyhow::Error> {
         debug!("Creating new subagent with id: {}", config.id);
 
-        // Create the internal agent
-        let parent_agent = Arc::new(Agent::new());
-        parent_agent.update_provider(provider).await?;
+        let mut missing_extensions = Vec::new();
+        let mut recipe_extensions = Vec::new();
 
-        // Set up extensions from the recipe
+        // Check if extensions from recipe exist in the extension manager
         if let Some(extensions) = &config.recipe.extensions {
             for extension in extensions {
-                if let Err(e) = parent_agent.add_extension(extension.clone()).await {
-                    error!("Failed to add extension to subagent {}: {}", config.id, e);
-                    return Err(anyhow!("Failed to add extension: {}", e));
+                let extension_name = extension.name();
+                let existing_extensions = extension_manager.list_extensions().await?;
+                
+                if !existing_extensions.contains(&extension_name) {
+                    missing_extensions.push(extension_name);
+                } else {
+                    recipe_extensions.push(extension_name);
                 }
             }
-        }
-
-        // Set up custom system prompt from recipe instructions
-        if let Some(instructions) = &config.recipe.instructions {
-            parent_agent.extend_system_prompt(instructions.clone()).await;
         }
 
         let subagent = Arc::new(SubAgent {
@@ -109,9 +116,10 @@ impl SubAgent {
             conversation: Arc::new(Mutex::new(Vec::new())),
             status: Arc::new(RwLock::new(SubAgentStatus::Ready)),
             config,
-            parent_agent,
             turn_count: Arc::new(Mutex::new(0)),
             created_at: Utc::now(),
+            recipe_extensions: Arc::new(Mutex::new(recipe_extensions)),
+            missing_extensions: Arc::new(Mutex::new(missing_extensions)),
         });
 
         // Create a background task handle (for future use with streaming/monitoring)
@@ -157,8 +165,12 @@ impl SubAgent {
     }
 
     /// Process a message and generate a response using the subagent's provider
-    #[instrument(skip(self, message))]
-    pub async fn reply_subagent(&self, message: String) -> Result<Message> {
+    #[instrument(skip(self, message, provider, extension_manager))]
+    pub async fn reply_subagent(&self,
+        message: String,
+        provider: Arc<dyn Provider>,
+        extension_manager: Arc<tokio::sync::RwLockReadGuard<'_, ExtensionManager>>
+    ) -> Result<Message, anyhow::Error> {
         debug!("Processing message for subagent {}", self.id);
 
         // Check if we've exceeded max turns
@@ -189,63 +201,97 @@ impl SubAgent {
         }
 
         // Get the current conversation for context
-        let messages = self.get_conversation().await;
+        let mut messages = self.get_conversation().await;
 
-        // Get tools and system prompt from the agent
-        let (tools, toolshim_tools, system_prompt) = self.parent_agent.prepare_tools_and_prompt().await?;
-
+        // Get tools and system prompt from the extension manager
+        let tools: Vec<Tool> = extension_manager.get_prefixed_tools(None).await?;
+        let toolshim_tools: Vec<Tool> = vec![];
+        let system_prompt = format!(
+            "You are a helpful subagent that was spawned by goose. You converse with goose and can use the following tools: {}\n\n{}",
+            self.recipe_extensions.lock().await.join(", "),
+            self.config.recipe.instructions.as_deref().unwrap_or("")
+        );
+        // Wait for 10 seconds before proceeding
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
         // Generate response from provider
-        match Agent::generate_response_from_provider(
-            self.parent_agent.provider().await?,
-            &system_prompt,
-            &messages,
-            &tools,
-            &toolshim_tools,
-        ).await {
-            Ok((response, _usage)) => {
-                // Add the assistant's response to the conversation
-                self.add_message(response.clone()).await;
-
-                // Process any tool calls in the response
-                let (_, remaining_requests, filtered_response) = 
-                    self.parent_agent.categorize_tool_requests(&response).await;
-
-                // Process all tool requests directly without permission checks
-                let mut final_response = filtered_response.clone();
-
-                // Handle remaining tools
-                for request in &remaining_requests {
-                    if let Ok(tool_call) = &request.tool_call {
-                        let extension_manager = self.parent_agent.extension_manager.lock().await;
-                        match extension_manager.dispatch_tool_call(tool_call.clone()).await {
-                            Ok(tool_result) => {
-                                let tool_response = tool_result.result.await;
-                                final_response = final_response.with_tool_response(request.id.clone(), tool_response);
+        loop {
+            match Agent::generate_response_from_provider(
+                Arc::clone(&provider),
+                &system_prompt,
+                &messages,
+                &tools,
+                &toolshim_tools,
+            ).await {
+                Ok((response, _usage)) => {
+                    // Process any tool calls in the response
+                    let tool_requests: Vec<ToolRequest> = response
+                        .content
+                        .iter()
+                        .filter_map(|content| {
+                            if let MessageContent::ToolRequest(req) = content {
+                                Some(req.clone())
+                            } else {
+                                None
                             }
-                            Err(e) => {
-                                final_response = final_response.with_tool_response(
-                                    request.id.clone(),
-                                    Err(ToolError::ExecutionError(e.to_string()))
-                                );
+                        })
+                        .collect();
+
+                    // println!("subagent tool_requests: {:?}", tool_requests);
+                    // println!("subagent response: {:?}", response);
+
+                    // Process all tool requests directly without permission checks
+                    let mut final_response = response.clone();
+
+                    // Handle remaining tools
+                    for request in &tool_requests {
+                        if let Ok(tool_call) = &request.tool_call {
+                            match extension_manager.dispatch_tool_call(tool_call.clone()).await {
+                                Ok(result) => {
+                                    let tool_response = result.result.await;
+                                    final_response = final_response.with_tool_response(request.id.clone(), tool_response.clone());
+                                    // Add tool response to conversation
+                                    self.add_message(Message::user().with_text(format!("Tool response: {:?}", tool_response))).await;
+                                    messages.push(Message::user().with_text(format!("Tool response: {:?}", tool_response)));
+                                }
+                                Err(e) => {
+                                    final_response = final_response.with_tool_response(
+                                        request.id.clone(),
+                                        Err(ToolError::ExecutionError(e.to_string()))
+                                    );
+                                    // Add error to conversation
+                                    self.add_message(Message::user().with_text(format!("Tool error: {}", e))).await;
+                                    messages.push(Message::user().with_text(format!("Tool error: {}", e)));
+                                }
                             }
                         }
                     }
-                }
+                    // If there are no tool requests, we're done
+                    if tool_requests.is_empty() {
+                        self.add_message(final_response.clone()).await;
+                        messages.push(final_response.clone());
 
-                // Set status back to ready
-                self.set_status(SubAgentStatus::Ready).await;
-                Ok(final_response)
-            },
-            Err(ProviderError::ContextLengthExceeded(_)) => {
-                self.set_status(SubAgentStatus::Completed("Context length exceeded".to_string())).await;
-                Ok(Message::assistant().with_context_length_exceeded(
-                    "The context length of the model has been exceeded. Please start a new session and try again.",
-                ))
-            },
-            Err(e) => {
-                self.set_status(SubAgentStatus::Completed(format!("Error: {}", e))).await;
-                error!("Error: {}", e);
-                Ok(Message::assistant().with_text(format!("Ran into this error: {e}.\n\nPlease retry if you think this is a transient or recoverable error.")))
+                        // Set status back to ready and return the final response
+                        self.set_status(SubAgentStatus::Ready).await;
+                        break Ok(response);
+                    }
+                },
+                Err(ProviderError::ContextLengthExceeded(_)) => {
+                    self.set_status(SubAgentStatus::Completed("Context length exceeded".to_string())).await;
+                    break Ok(Message::assistant().with_context_length_exceeded(
+                        "The context length of the model has been exceeded. Please start a new session and try again.",
+                    ))
+                },
+                Err(ProviderError::RateLimitExceeded(_)) => {
+                    self.set_status(SubAgentStatus::Completed("Rate limit exceeded".to_string())).await;
+                    break Ok(Message::assistant().with_text("Rate limit exceeded. Please try again later."))
+                },
+                Err(e) => {
+                    self.set_status(SubAgentStatus::Completed(format!("Error: {}", e))).await;
+                    error!("Error: {}", e);
+                    break Ok(Message::assistant().with_text(format!("Ran into this error: {e}.\n\nPlease retry if you think this is a transient or recoverable error.")))
+                }
             }
         }
     }
@@ -270,7 +316,7 @@ impl SubAgent {
     }
 
     /// Terminate the subagent
-    pub async fn terminate(&self) -> Result<()> {
+    pub async fn terminate(&self) -> Result<(), anyhow::Error> {
         debug!("Terminating subagent {}", self.id);
         self.set_status(SubAgentStatus::Terminated).await;
         Ok(())
@@ -308,5 +354,10 @@ impl SubAgent {
 
         formatted.push_str("=== End Conversation ===\n");
         formatted
+    }
+
+    /// Get the list of extensions that weren't enabled
+    pub async fn get_missing_extensions(&self) -> Vec<String> {
+        self.missing_extensions.lock().await.clone()
     }
 }

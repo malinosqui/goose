@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mcp_core::{Content, ToolError};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::agents::Agent;
 use crate::agents::subagent_types::SpawnSubAgentArgs;
@@ -45,8 +46,11 @@ impl Agent {
             ToolError::ExecutionError(format!("Failed to get provider: {}", e))
         })?;
 
+        // Get the extension manager from the parent agent
+        let extension_manager = Arc::new(self.extension_manager.read().await);
+
         // Spawn the subagent
-        match manager.spawn_interactive_subagent(args, provider).await {
+        match manager.spawn_interactive_subagent(args, provider, extension_manager).await {
             Ok(subagent_id) => {
                 Ok(vec![Content::text(format!(
                     "Subagent spawned successfully with ID: {}\nUse platform__get_subagent_status to check progress.",
