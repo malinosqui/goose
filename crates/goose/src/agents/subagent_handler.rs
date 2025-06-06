@@ -152,4 +152,47 @@ impl Agent {
             }
         }
     }
+
+    /// Handle sending a message to an existing subagent
+    pub async fn handle_send_message_to_subagent(
+        &self,
+        arguments: Value,
+    ) -> Result<Vec<Content>, ToolError> {
+        let subagent_manager = self.subagent_manager.lock().await;
+        let manager = subagent_manager.as_ref().ok_or_else(|| {
+            ToolError::ExecutionError("Subagent manager not initialized".to_string())
+        })?;
+
+        // Parse arguments
+        let subagent_id = arguments
+            .get("subagent_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionError("Missing subagent_id parameter".to_string()))?
+            .to_string();
+
+        let message = arguments
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionError("Missing message parameter".to_string()))?
+            .to_string();
+
+        // Get the provider from the parent agent
+        let provider = self.provider().await.map_err(|e| {
+            ToolError::ExecutionError(format!("Failed to get provider: {}", e))
+        })?;
+
+        // Get the extension manager from the parent agent
+        let extension_manager = Arc::new(self.extension_manager.read().await);
+
+        // Send message to subagent and get response
+        match manager.send_message_to_subagent(&subagent_id, message, provider, extension_manager).await {
+            Ok(response) => {
+                Ok(vec![Content::text(response)])
+            }
+            Err(e) => Err(ToolError::ExecutionError(format!(
+                "Failed to send message to subagent: {}",
+                e
+            ))),
+        }
+    }
 } 

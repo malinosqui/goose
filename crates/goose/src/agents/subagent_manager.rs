@@ -126,24 +126,26 @@ impl SubAgentManager {
     }
 
     /// Send a message to a specific subagent
-    #[instrument(skip(self, message))]
+    #[instrument(skip(self, message, provider, extension_manager))]
     pub async fn send_message_to_subagent(
         &self,
         subagent_id: &str,
         message: String,
+        provider: Arc<dyn Provider>,
+        extension_manager: Arc<tokio::sync::RwLockReadGuard<'_, ExtensionManager>>,
     ) -> Result<String> {
         let subagent = self
             .get_subagent(subagent_id)
             .await
             .ok_or_else(|| anyhow!("Subagent {} not found", subagent_id))?;
 
-        // Add the message to the subagent's conversation
-        let user_message = crate::message::Message::user().with_text(message);
-        subagent.add_message(user_message).await;
-
-        // For now, we'll just return a success message
-        // In a full implementation, you would process the message through the agent
-        Ok(format!("Message sent to subagent {}", subagent_id))
+        // Process the message and get a reply
+        match subagent.reply_subagent(message, provider, extension_manager).await {
+            Ok(response) => {
+                Ok(format!("Message sent to subagent {}. Response:\n{}", subagent_id, response.as_concat_text()))
+            }
+            Err(e) => Err(anyhow!("Failed to process message in subagent: {}", e))
+        }
     }
 
     /// Terminate a specific subagent

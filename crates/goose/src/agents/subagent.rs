@@ -211,10 +211,7 @@ impl SubAgent {
             self.recipe_extensions.lock().await.join(", "),
             self.config.recipe.instructions.as_deref().unwrap_or("")
         );
-        // Wait for 10 seconds before proceeding
-        for _ in 0..30 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+
         // Generate response from provider
         loop {
             match Agent::generate_response_from_provider(
