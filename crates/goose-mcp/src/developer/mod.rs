@@ -128,7 +128,7 @@ impl DeveloperRouter {
         _old_str: &str,
         update_snippet: &str,
     ) -> Result<String, String> {
-        println!("Calling Editor API");
+        eprintln!("Calling Editor API");
         use reqwest::Client;
         use serde_json::{json, Value};
 
@@ -201,7 +201,7 @@ impl DeveloperRouter {
             .and_then(|message| message.get("content"))
             .and_then(|content| content.as_str())
             .ok_or_else(|| "Invalid response format".to_string())?;
-        println!("Editor API worked");
+        eprintln!("Editor API worked");
         Ok(content.to_string())
     }
 
@@ -884,8 +884,9 @@ impl DeveloperRouter {
         old_str: &str,
         new_str: &str,
     ) -> Result<Vec<Content>, ToolError> {
-        println!("text_editor_replace called ");
-        // Check if file exists and is active
+        eprintln!("text_editor_replace called ");
+        
+        // Check if file exists first
         if !path.exists() {
             return Err(ToolError::InvalidParameters(format!(
                 "File '{}' does not exist, you can write a new file with the `write` command",
@@ -897,7 +898,45 @@ impl DeveloperRouter {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
 
-        // Ensure 'old_str' appears exactly once
+        // Check if Editor API is configured and use it as the primary path
+        if self.is_editor_api_configured() {
+            // Editor API path - save history then call API directly
+            self.save_file_history(path)?;
+            
+            match self.call_editor_api(&content, old_str, new_str).await {
+                Ok(updated_content) => {
+                    // Write the updated content directly
+                    let normalized_content = normalize_line_endings(&updated_content);
+                    std::fs::write(path, &normalized_content)
+                        .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+
+                    // Simple success message for Editor API
+                    return Ok(vec![
+                        Content::text(format!("Successfully edited {}", path.display()))
+                            .with_audience(vec![Role::Assistant]),
+                        Content::text(format!("File {} has been edited", path.display()))
+                            .with_audience(vec![Role::User])
+                            .with_priority(0.2),
+                    ]);
+                }
+                Err(e) => {
+                    eprintln!("Editor API call failed: {}, falling back to string replacement", e);
+                    // Fall through to traditional path below
+                }
+            }
+        }
+
+        // Traditional string replacement path (original logic)
+        // Show helpful message once per session when not using Editor API
+        static SHOWN_HELP: std::sync::Once = std::sync::Once::new();
+        SHOWN_HELP.call_once(|| {
+            eprintln!("Note: To enable AI-powered code editing, set these environment variables:");
+            eprintln!("  GOOSE_EDITOR_API_KEY - Your API key");
+            eprintln!("  GOOSE_EDITOR_HOST - The API host (e.g., https://api.openai.com/v1)");
+            eprintln!("  GOOSE_EDITOR_MODEL - The model name (e.g., gpt-4o, claude-3-5-sonnet-20241022)");
+        });
+
+        // Ensure 'old_str' appears exactly once (original validation logic)
         if content.matches(old_str).count() > 1 {
             return Err(ToolError::InvalidParameters(
                 "'old_str' must appear exactly once in the file, but it appears multiple times"
@@ -910,35 +949,10 @@ impl DeveloperRouter {
             ));
         }
 
-        // Save history for undo
+        // Save history for undo (original behavior - after validation)
         self.save_file_history(path)?;
 
-        // Check if Editor API is configured before attempting to use it
-        let new_content = if self.is_editor_api_configured() {
-            match self.call_editor_api(&content, old_str, new_str).await {
-                Ok(updated_content) => updated_content,
-                Err(e) => {
-                    // Fallback to simple string replacement if API call fails
-                    eprintln!(
-                        "Editor API call failed: {}, falling back to string replacement",
-                        e
-                    );
-                    content.replace(old_str, new_str)
-                }
-            }
-        } else {
-            // Use simple string replacement when Editor API is not configured
-            // Show helpful message once per session
-            static SHOWN_HELP: std::sync::Once = std::sync::Once::new();
-            SHOWN_HELP.call_once(|| {
-                eprintln!("Note: To enable AI-powered code editing, set these environment variables:");
-                eprintln!("  GOOSE_EDITOR_API_KEY - Your API key");
-                eprintln!("  GOOSE_EDITOR_HOST - The API host (e.g., https://api.openai.com/v1)");
-                eprintln!("  GOOSE_EDITOR_MODEL - The model name (e.g., gpt-4o, claude-3-5-sonnet-20241022)");
-            });
-            content.replace(old_str, new_str)
-        };
-
+        let new_content = content.replace(old_str, new_str);
         let normalized_content = normalize_line_endings(&new_content);
         std::fs::write(path, &normalized_content)
             .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
