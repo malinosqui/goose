@@ -44,7 +44,7 @@ use mcp_core::{
 
 use crate::agents::subagent_tools::{
     SUBAGENT_CHECK_PROGRESS_TOOL_NAME, SUBAGENT_LIST_TOOL_NAME,
-    SUBAGENT_SPAWN_INTERACTIVE_TOOL_NAME,
+    SUBAGENT_SPAWN_INTERACTIVE_TOOL_NAME, SUBAGENT_SEND_MESSAGE_TOOL_NAME,
 };
 
 use super::platform_tools;
@@ -459,6 +459,7 @@ impl Agent {
             prefixed_tools.push(subagent_tools::spawn_interactive_subagent_tool());
             prefixed_tools.push(subagent_tools::list_subagents_tool());
             prefixed_tools.push(subagent_tools::check_subagent_progress_tool());
+            prefixed_tools.push(subagent_tools::send_message_to_subagent_tool());
 
             // Add resource tools if supported
             if extension_manager.supports_resources() {
