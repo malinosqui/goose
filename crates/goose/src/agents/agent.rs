@@ -261,6 +261,11 @@ impl Agent {
                 self.handle_get_subagent_status(tool_call.arguments.clone())
                     .await,
             )
+        } else if tool_call.name == SUBAGENT_SEND_MESSAGE_TOOL_NAME {
+            ToolCallResult::from(
+                self.handle_send_message_to_subagent(tool_call.arguments.clone())
+                    .await,
+            )
         } else if self.is_frontend_tool(&tool_call.name).await {
             // For frontend tools, return an error indicating we need frontend execution
             ToolCallResult::from(Err(ToolError::ExecutionError(
