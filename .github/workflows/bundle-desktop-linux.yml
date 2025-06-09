@@ -60,7 +60,7 @@ jobs:
             libxrandr2 \
             libgbm1 \
             libxss1 \
-            libasound2 \
+            libasound2t64 \
             rpm \
             fakeroot \
             dpkg-dev
