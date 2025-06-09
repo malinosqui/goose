@@ -1,0 +1,179 @@
+name: "Bundle Desktop (Linux)"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'ui/desktop/**'
+      - 'crates/goose-server/**'
+      - '.github/workflows/bundle-desktop-linux.yml'
+  push:
+    branches: [ "micn/linux-desktop-app" ]  # Only run on this specific branch for now
+    paths:
+      - 'ui/desktop/**'
+      - 'crates/goose-server/**'
+      - '.github/workflows/bundle-desktop-linux.yml'
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build-desktop-linux:
+    name: Build Desktop (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Check out source
+      - name: Checkout repository
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
+        with:
+          fetch-depth: 0
+
+      # 2) Debug information
+      - name: Debug workflow info
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "=== Workflow Information ==="
+          echo "Workflow: ${WORKFLOW_NAME}"
+          echo "Ref: ${WORKFLOW_REF}"
+          echo "Event: ${EVENT_NAME}"
+          echo "Repo: ${REPOSITORY}"
+          echo ""
+          echo "=== System Information ==="
+          uname -a
+          lsb_release -a || true
+          df -h
+
+      # 3) Install system dependencies for Linux packaging
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libnss3-dev \
+            libatk-bridge2.0-dev \
+            libdrm2 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libgbm1 \
+            libxss1 \
+            libasound2 \
+            rpm \
+            fakeroot \
+            dpkg-dev
+
+      # 4) Set up Rust
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # 5) Set up Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 23
+          cache: 'npm'
+          cache-dependency-path: ui/desktop/package-lock.json
+
+      # 6) Cache Rust dependencies
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/index
+          key: ${{ runner.os }}-cargo-index
+          restore-keys: |
+            ${{ runner.os }}-cargo-index
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # 7) Build the Rust goosed binary
+      - name: Build goosed binary
+        run: |
+          echo "Building goosed binary for Linux..."
+          cargo build --release -p goose-server
+          ls -la target/release/
+          file target/release/goosed
+
+      # 8) Copy binary to Electron folder
+      - name: Copy binary into Electron folder
+        run: |
+          echo "Copying goosed binary to ui/desktop/src/bin/"
+          mkdir -p ui/desktop/src/bin
+          cp target/release/goosed ui/desktop/src/bin/
+          chmod +x ui/desktop/src/bin/goosed
+          ls -la ui/desktop/src/bin/
+
+      # 9) Install npm dependencies
+      - name: Install npm dependencies
+        run: |
+          cd ui/desktop
+          npm ci
+
+      # 10) Build Electron app with Linux makers (.deb and .rpm)
+      - name: Build Linux packages
+        run: |
+          cd ui/desktop
+          echo "Building Linux packages (.deb and .rpm)..."
+          
+          # Build both .deb and .rpm packages
+          npm run make -- --platform=linux --arch=x64
+          
+          echo "Build completed. Checking output..."
+          ls -la out/
+          find out/ -name "*.deb" -o -name "*.rpm" | head -10
+
+      # 11) List all generated files for debugging
+      - name: List generated files
+        run: |
+          echo "=== All files in out/ directory ==="
+          find ui/desktop/out/ -type f | head -20
+          echo ""
+          echo "=== Package files specifically ==="
+          find ui/desktop/out/ -name "*.deb" -o -name "*.rpm"
+          echo ""
+          echo "=== File sizes ==="
+          find ui/desktop/out/ -name "*.deb" -o -name "*.rpm" -exec ls -lh {} \;
+
+      # 12) Upload .deb package
+      - name: Upload .deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: goose-linux-deb
+          path: ui/desktop/out/make/deb/x64/*.deb
+          if-no-files-found: error
+
+      # 13) Upload .rpm package  
+      - name: Upload .rpm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: goose-linux-rpm
+          path: ui/desktop/out/make/rpm/x64/*.rpm
+          if-no-files-found: error
+
+      # 14) Create combined artifact with both packages
+      - name: Upload combined Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: goose-linux-packages
+          path: |
+            ui/desktop/out/make/deb/x64/*.deb
+            ui/desktop/out/make/rpm/x64/*.rpm
+          if-no-files-found: error
