@@ -63,7 +63,8 @@ jobs:
             libasound2t64 \
             rpm \
             fakeroot \
-            dpkg-dev
+            dpkg-dev \
+            protobuf-compiler
 
       # 4) Set up Rust
       - name: Set up Rust
