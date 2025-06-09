@@ -19,6 +19,12 @@ pub struct CompletionRequest {
     pub system_preamble: String,
     pub messages: Vec<Message>,
     pub extensions: Vec<ExtensionConfig>,
+    #[serde(default = "default_use_pool")]
+    pub use_pool: bool,
+}
+
+fn default_use_pool() -> bool {
+    true
 }
 
 impl CompletionRequest {
@@ -37,7 +43,13 @@ impl CompletionRequest {
             system_preamble,
             messages,
             extensions,
+            use_pool: true,
         }
+    }
+    
+    pub fn with_pool_option(mut self, use_pool: bool) -> Self {
+        self.use_pool = use_pool;
+        self
     }
 }
 
@@ -49,15 +61,22 @@ pub fn create_completion_request(
     system_preamble: &str,
     messages: Vec<Message>,
     extensions: Vec<ExtensionConfig>,
+    use_pool: Option<bool>,
 ) -> CompletionRequest {
-    CompletionRequest::new(
+    let request = CompletionRequest::new(
         provider_name.to_string(),
         provider_config,
         model_config,
         system_preamble.to_string(),
         messages,
         extensions,
-    )
+    );
+    
+    if let Some(use_pool) = use_pool {
+        request.with_pool_option(use_pool)
+    } else {
+        request
+    }
 }
 
 uniffi::custom_type!(CompletionRequest, String, {

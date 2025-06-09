@@ -342,6 +342,6 @@ kotlin-example:
       -d example.jar
 
     cd bindings/kotlin/ && java \
-      -Djna.library.path=$HOME/Development/goose/target/debug \
+      -Djna.library.path=$HOME/Development/secgoose/goose/target/debug \
       -classpath "example.jar:libs/kotlin-stdlib-1.9.0.jar:libs/kotlinx-coroutines-core-jvm-1.7.3.jar:libs/jna-5.13.0.jar" \
       UsageKt
